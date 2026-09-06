@@ -510,7 +510,7 @@ public class ApkEngine {
                 .verify();
         if (!res.isVerified()) {
             StringBuilder sb = new StringBuilder("APK validation failed");
-            for (ApkVerifier.Issue err : res.getErrors()) sb.append("\n- ").append(err);
+            for (Object err : res.getErrors()) sb.append("\n- ").append(err);
             throw new IOException(sb.toString());
         }
     }
