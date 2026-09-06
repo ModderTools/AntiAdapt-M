@@ -8,6 +8,7 @@
 
     <application
         android:label="AntiAdapt M"
+        android:icon="@drawable/logo"
         android:allowBackup="true"
         android:requestLegacyExternalStorage="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
