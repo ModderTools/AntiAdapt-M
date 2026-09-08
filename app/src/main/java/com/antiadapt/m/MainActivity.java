@@ -20,9 +20,13 @@ import android.provider.Settings;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.WindowManager;
+import android.widget.BaseAdapter;
 import android.widget.Button;
 import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.widget.ListView;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -43,6 +47,7 @@ public class MainActivity extends Activity {
     private static final int REQ_FILE = 11;
 
     public static class P {
+        public boolean isDark;
         public int bg, text, sub, card, border, accent, btnText;
     }
 
@@ -56,7 +61,6 @@ public class MainActivity extends Activity {
     private P p = new P();
     private volatile boolean cancelled = false;
     private volatile boolean busy = false;
-    private boolean folderChecked = false;
 
     public static boolean resolveDark(Activity a, String mode) {
         if ("dark".equals(mode)) return true;
@@ -67,6 +71,7 @@ public class MainActivity extends Activity {
 
     public static P makePalette(boolean dark) {
         P p = new P();
+        p.isDark = dark;
         if (dark) {
             p.bg = 0xFF0B1F33; p.text = 0xFFEAF2FB; p.sub = 0xFF8FA9C4;
             p.card = 0xFF12314F; p.border = 0xFF1E466B;
@@ -94,7 +99,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
-        if (!folderChecked) { folderChecked = true; firstRunFolder(); }
+        ensureOutputFolder();
     }
 
     // ================================================================
@@ -256,7 +261,7 @@ public class MainActivity extends Activity {
     }
 
     // ================================================================
-    // PERMISSIONS + FIRST RUN FOLDER
+    // PERMISSIONS + OUTPUT FOLDER
     // ================================================================
 
     private void ensurePermissions() {
@@ -285,16 +290,34 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void firstRunFolder() {
-        SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
-        if (sp.getBoolean("folder_created", false)) return;
+    private boolean hasStorageAccess() {
+        if (Build.VERSION.SDK_INT >= 30) return Environment.isExternalStorageManager();
+        if (Build.VERSION.SDK_INT >= 23)
+            return checkSelfPermission("android.permission.WRITE_EXTERNAL_STORAGE")
+                    == PackageManager.PERMISSION_GRANTED;
+        return true;
+    }
+
+    private void ensureOutputFolder() {
         new Thread(() -> {
             try {
-                File d = ApkEngine.defaultOutputDir(this, null);
-                sp.edit().putBoolean("folder_created", true).apply();
-                appendLog("Output folder ready: " + d.getAbsolutePath());
+                if (!hasStorageAccess()) {
+                    appendLog("Tip: grant 'All files access' so APKs save to "
+                            + "/storage/emulated/0/AntiAdapt M");
+                    return;
+                }
+                File d = new File(Environment.getExternalStorageDirectory(), "AntiAdapt M");
+                boolean createdNow = !d.exists();
+                if (createdNow) d.mkdirs();
+                if (d.isDirectory()) {
+                    SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
+                    if (!sp.getBoolean("folder_created", false) || createdNow) {
+                        sp.edit().putBoolean("folder_created", true).apply();
+                        appendLog("Output folder ready: " + d.getAbsolutePath());
+                    }
+                }
             } catch (Exception e) {
-                appendLog("Folder creation pending: grant storage permission, then retry.");
+                appendLog("Folder creation failed: " + e.getMessage());
             }
         }).start();
     }
@@ -392,7 +415,7 @@ public class MainActivity extends Activity {
     }
 
     // ================================================================
-    // INSTALLED APP SELECTION
+    // INSTALLED APP SELECTION (icon + name, system apps in blue)
     // ================================================================
 
     private void pickInstalledApp() {
@@ -401,33 +424,136 @@ public class MainActivity extends Activity {
         new Thread(() -> {
             try {
                 PackageManager pm = getPackageManager();
-                List<ApplicationInfo> apps = new ArrayList<>();
-                for (ApplicationInfo ai : pm.getInstalledApplications(0))
-                    if (ai.sourceDir != null) apps.add(ai);
-                List<String> labels = new ArrayList<>();
-                for (ApplicationInfo ai : apps) {
-                    CharSequence l = pm.getApplicationLabel(ai);
-                    labels.add(l == null ? ai.packageName : l.toString());
+                List<ApplicationInfo> all = pm.getInstalledApplications(0);
+                List<ApplicationInfo> user = new ArrayList<>();
+                List<ApplicationInfo> sys = new ArrayList<>();
+                for (ApplicationInfo ai : all) {
+                    if (ai.sourceDir == null) continue;
+                    if ((ai.flags & ApplicationInfo.FLAG_SYSTEM) != 0) sys.add(ai);
+                    else user.add(ai);
                 }
-                for (int i = 0; i < apps.size(); i++)
-                    for (int j = i + 1; j < apps.size(); j++)
-                        if (labels.get(j).compareToIgnoreCase(labels.get(i)) < 0) {
-                            Collections.swap(labels, i, j);
-                            Collections.swap(apps, i, j);
-                        }
-                List<ApplicationInfo> finalApps = apps;
+                sortByLabel(pm, user);
+                sortByLabel(pm, sys);
+                List<ApplicationInfo> merged = new ArrayList<>(user);
+                merged.addAll(sys);
+                final int userCount = user.size();
                 runOnUiThread(() -> {
-                    AlertDialog.Builder b = new AlertDialog.Builder(this);
-                    b.setTitle("Select App (" + finalApps.size() + ")");
-                    b.setItems(labels.toArray(new String[0]),
-                            (d, w) -> processInstalled(finalApps.get(w)));
-                    b.setNegativeButton("Cancel", null);
-                    b.show();
+                    appendLog(userCount + " user apps, "
+                            + (merged.size() - userCount) + " system apps (blue).");
+                    showAppDialog(merged);
                 });
             } catch (Exception e) {
                 appendLog("Could not list apps: " + e.getMessage());
             }
         }).start();
+    }
+
+    private void sortByLabel(PackageManager pm, List<ApplicationInfo> list) {
+        List<String> labels = new ArrayList<>();
+        for (ApplicationInfo ai : list) {
+            CharSequence l = pm.getApplicationLabel(ai);
+            labels.add(l == null ? ai.packageName : l.toString());
+        }
+        for (int i = 0; i < list.size(); i++)
+            for (int j = i + 1; j < list.size(); j++)
+                if (labels.get(j).compareToIgnoreCase(labels.get(i)) < 0) {
+                    Collections.swap(labels, i, j);
+                    Collections.swap(list, i, j);
+                }
+    }
+
+    private void showAppDialog(final List<ApplicationInfo> apps) {
+        ListView lv = new ListView(this);
+        lv.setDivider(null);
+        lv.setPadding(dp(4), dp(4), dp(4), dp(4));
+        lv.setAdapter(new AppListAdapter(apps));
+        AlertDialog dlg = new AlertDialog.Builder(this)
+                .setTitle("Select App (" + apps.size() + ")")
+                .setView(lv)
+                .setNegativeButton("Cancel", null)
+                .create();
+        lv.setOnItemClickListener((parent, v, pos, id) -> {
+            dlg.dismiss();
+            processInstalled(apps.get(pos));
+        });
+        dlg.show();
+        try {
+            WindowManager.LayoutParams wlp = new WindowManager.LayoutParams();
+            wlp.copyFrom(dlg.getWindow().getAttributes());
+            wlp.width = (int) (getResources().getDisplayMetrics().widthPixels * 0.92);
+            wlp.height = (int) (getResources().getDisplayMetrics().heightPixels * 0.78);
+            dlg.getWindow().setAttributes(wlp);
+        } catch (Exception ignored) {}
+    }
+
+    private class AppListAdapter extends BaseAdapter {
+        private final List<ApplicationInfo> items;
+        private final PackageManager pm;
+
+        AppListAdapter(List<ApplicationInfo> items) {
+            this.items = items;
+            this.pm = getPackageManager();
+        }
+
+        @Override public int getCount() { return items.size(); }
+        @Override public Object getItem(int position) { return items.get(position); }
+        @Override public long getItemId(int position) { return position; }
+
+        @Override public View getView(int position, View convertView, ViewGroup parent) {
+            VH h;
+            if (convertView == null) {
+                h = new VH();
+                LinearLayout row = new LinearLayout(MainActivity.this);
+                row.setOrientation(LinearLayout.HORIZONTAL);
+                row.setGravity(Gravity.CENTER_VERTICAL);
+                row.setPadding(dp(14), dp(9), dp(14), dp(9));
+
+                h.icon = new ImageView(MainActivity.this);
+                LinearLayout.LayoutParams ilp =
+                        new LinearLayout.LayoutParams(dp(42), dp(42));
+                ilp.rightMargin = dp(12);
+                h.icon.setLayoutParams(ilp);
+                h.icon.setScaleType(ImageView.ScaleType.FIT_CENTER);
+                row.addView(h.icon);
+
+                LinearLayout col = new LinearLayout(MainActivity.this);
+                col.setOrientation(LinearLayout.VERTICAL);
+                h.name = new TextView(MainActivity.this);
+                h.name.setTextSize(15);
+                h.name.setTypeface(Typeface.DEFAULT_BOLD);
+                h.name.setMaxLines(1);
+                col.addView(h.name);
+                h.pkg = new TextView(MainActivity.this);
+                h.pkg.setTextSize(11);
+                h.pkg.setMaxLines(1);
+                col.addView(h.pkg, lp(-1, -2, 2));
+
+                row.addView(col, new LinearLayout.LayoutParams(-1, -2));
+                convertView = row;
+                row.setTag(h);
+            } else {
+                h = (VH) convertView.getTag();
+            }
+
+            ApplicationInfo ai = items.get(position);
+            boolean system = (ai.flags & ApplicationInfo.FLAG_SYSTEM) != 0;
+            try {
+                h.icon.setImageDrawable(pm.getApplicationIcon(ai));
+            } catch (Exception e) {
+                h.icon.setImageResource(android.R.drawable.sym_def_app_icon);
+            }
+            CharSequence label = null;
+            try { label = pm.getApplicationLabel(ai); } catch (Exception ignored) {}
+            h.name.setText(label == null ? ai.packageName : label.toString());
+            h.pkg.setText(ai.packageName);
+
+            int blue = p.isDark ? 0xFF5AA9FF : 0xFF1565C0;
+            h.name.setTextColor(system ? blue : p.text);
+            h.pkg.setTextColor(p.sub);
+            return convertView;
+        }
+
+        class VH { ImageView icon; TextView name; TextView pkg; }
     }
 
     private void processInstalled(ApplicationInfo ai) {
