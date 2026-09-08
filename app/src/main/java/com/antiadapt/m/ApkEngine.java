@@ -18,7 +18,6 @@ import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
 import org.json.JSONObject;
 
 import java.io.BufferedOutputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -34,15 +33,12 @@ import java.security.cert.Certificate;
 import java.security.cert.X509Certificate;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
-import java.util.Calendar;
 import java.util.Collections;
 import java.util.Date;
 import java.util.Enumeration;
 import java.util.List;
 import java.util.Locale;
 import java.util.zip.CRC32;
-import java.util.zip.Deflater;
-import java.util.zip.DeflaterOutputStream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 import java.util.zip.ZipOutputStream;
@@ -161,7 +157,7 @@ public class ApkEngine {
     }
 
     // ================================================================
-    // CORE PIPELINE
+    // CORE PIPELINE  (no ZIP rewriting - signer replaces blocks directly)
     // ================================================================
 
     private static String finishPipeline(Context ctx, File workApk, String baseName,
@@ -169,28 +165,37 @@ public class ApkEngine {
         File finalApk;
         if (resign) {
             cb.onStage(ST_KILL);
-            cb.onLog("Kill Verification: removing signature blocks...");
-            File cleaned = new File(cacheDir(ctx), "clean_" + System.currentTimeMillis() + ".apk");
-            writeSignatureFreeApk(workApk, cleaned, cb);
-            cb.onLog("Old signature data removed.");
+            cb.onLog("Kill Verification: scanning signature protection...");
+            List<String> sigFiles = findV1SignatureFiles(workApk);
+            if (!sigFiles.isEmpty()) {
+                cb.onLog("JAR (v1) signature files found: " + sigFiles.size());
+                for (String s : sigFiles) cb.onLog("  - " + s);
+                cb.onLog("These will be neutralized by v2/v3 signing.");
+            } else {
+                cb.onLog("No JAR (v1) signature files found.");
+            }
+            cb.onLog("Existing v2/v3 signature blocks (if any) will be replaced.");
+            if (cb.isCancelled()) throw new IOException("CANCELLED");
+            cb.onProgress(40);
 
-            cb.onProgress(55);
             cb.onStage(ST_SIGN);
-            cb.onLog("Signing APK (v1 + v2 + v3 schemes)...");
+            cb.onLog("Signing APK (v2 + v3 schemes)...");
             getOrCreateKey(ctx);
-            File signed = new File(cacheDir(ctx), "signed_" + System.currentTimeMillis() + ".apk");
-            signApk(cleaned, signed, ctx);
-            cleaned.delete();
+            File signed = new File(cacheDir(ctx),
+                    "signed_" + System.currentTimeMillis() + ".apk");
+            signApk(workApk, signed, ctx);
             cb.onLog("Signed with AntiAdapt M managed key (RSA-2048).");
-            cb.onProgress(80);
+            cb.onLog("Old signature blocks replaced - package re-signed.");
+            cb.onLog("Note: v2/v3 signed APKs install on Android 7.0+.");
+            cb.onProgress(75);
             finalApk = signed;
         } else {
             cb.onStage(ST_KILL);
             cb.onLog("Kill Verification: skipped (preserving original signature).");
-            cb.onProgress(55);
+            cb.onProgress(40);
             cb.onStage(ST_SIGN);
-            cb.onLog("APK Signing: skipped (original signature valid).");
-            cb.onProgress(80);
+            cb.onLog("APK Signing: skipped (original signature preserved).");
+            cb.onProgress(75);
             finalApk = workApk;
         }
 
@@ -207,183 +212,28 @@ public class ApkEngine {
     }
 
     // ================================================================
-    // KILL VERIFICATION: signature-free rebuild with zipalign
+    // SIGNATURE DETECTION
     // ================================================================
 
-    private static void writeSignatureFreeApk(File in, File out, Callback cb) throws IOException {
+    private static List<String> findV1SignatureFiles(File apk) throws IOException {
+        List<String> out = new ArrayList<>();
         ZipFile zf;
-        try { zf = new ZipFile(in); }
+        try { zf = new ZipFile(apk); }
         catch (Exception ex) { throw new IOException("Corrupted package (cannot open as ZIP)."); }
         try {
-            long total = 0;
             Enumeration<? extends ZipEntry> en = zf.entries();
             while (en.hasMoreElements()) {
-                ZipEntry e = en.nextElement();
-                if (!isSignatureEntry(e.getName())) total += Math.max(1, e.getSize());
-            }
-
-            BufferedOutputStream bos =
-                    new BufferedOutputStream(new FileOutputStream(out), 1 << 16);
-            List<long[]> cd = new ArrayList<>();
-            List<String> names = new ArrayList<>();
-            long offset = 0, done = 0;
-            int dosTime = dosDateTime();
-
-            Enumeration<? extends ZipEntry> en2 = zf.entries();
-            while (en2.hasMoreElements()) {
-                ZipEntry e = en2.nextElement();
-                String name = e.getName();
-                if (isSignatureEntry(name)) { cb.onLog("Stripped: " + name); continue; }
-                if (cb.isCancelled()) { bos.close(); throw new IOException("CANCELLED"); }
-
-                byte[] nameB = name.getBytes("UTF-8");
-                boolean stored = e.getMethod() == ZipEntry.STORED;
-                long crc, csize, usize;
-                byte[] compressed = null;
-
-                if (stored) {
-                    crc = e.getCrc(); csize = e.getSize(); usize = e.getSize();
-                } else {
-                    InputStream is = zf.getInputStream(e);
-                    ByteArrayOutputStream raw = new ByteArrayOutputStream();
-                    byte[] buf = new byte[1 << 16];
-                    int r;
-                    while ((r = is.read(buf)) > 0) raw.write(buf, 0, r);
-                    is.close();
-                    byte[] data = raw.toByteArray();
-                    CRC32 c = new CRC32(); c.update(data);
-                    crc = c.getValue(); usize = data.length;
-                    ByteArrayOutputStream cout = new ByteArrayOutputStream();
-                    Deflater def = new Deflater(Deflater.BEST_SPEED, true);
-                    DeflaterOutputStream dos = new DeflaterOutputStream(cout, def, 1 << 16);
-                    dos.write(data);
-                    dos.finish();
-                    dos.close();
-                    def.end();
-                    compressed = cout.toByteArray();
-                    csize = compressed.length;
+                String n = en.nextElement().getName();
+                if (n.startsWith("META-INF/")) {
+                    String u = n.toUpperCase(Locale.US);
+                    if (u.endsWith(".SF") || u.endsWith(".RSA")
+                            || u.endsWith(".DSA") || u.endsWith(".EC")) out.add(n);
                 }
-
-                int extraLen = 0;
-                if (stored) {
-                    int align = name.endsWith(".so") ? 4096 : 4;
-                    long dataStart = offset + 30 + nameB.length;
-                    extraLen = (int) ((align - (dataStart % align)) % align);
-                }
-
-                byte[] lh = new byte[30];
-                putInt(lh, 0, 0x04034b50);
-                putShort(lh, 4, 20);
-                putShort(lh, 6, 0x0800);
-                putShort(lh, 8, stored ? 0 : 8);
-                putShort(lh, 10, dosTime & 0xFFFF);
-                putShort(lh, 12, (dosTime >>> 16) & 0xFFFF);
-                putInt(lh, 14, (int) crc);
-                putInt(lh, 18, (int) csize);
-                putInt(lh, 22, (int) usize);
-                putShort(lh, 26, nameB.length);
-                putShort(lh, 28, extraLen);
-                bos.write(lh);
-                bos.write(nameB);
-                if (extraLen > 0) bos.write(new byte[extraLen]);
-
-                if (stored) {
-                    InputStream is = zf.getInputStream(e);
-                    byte[] buf = new byte[1 << 16];
-                    long written = 0;
-                    CRC32 verify = new CRC32();
-                    int r;
-                    while ((r = is.read(buf)) > 0) {
-                        bos.write(buf, 0, r);
-                        verify.update(buf, 0, r);
-                        written += r;
-                        done += r;
-                        if (cb.isCancelled()) { is.close(); bos.close(); throw new IOException("CANCELLED"); }
-                    }
-                    is.close();
-                    if (written != usize || verify.getValue() != crc)
-                        throw new IOException("Corrupted package: entry '" + name + "' failed integrity check.");
-                } else {
-                    bos.write(compressed);
-                    done += usize;
-                }
-
-                cd.add(new long[]{ stored ? 0 : 8, dosTime, crc, csize, usize, nameB.length, offset });
-                names.add(name);
-                offset += 30 + nameB.length + extraLen + csize;
-
-                cb.onProgress((int) Math.min(54, 30 + done * 24 / Math.max(1, total)));
             }
-
-            long cdStart = offset;
-            for (int i = 0; i < cd.size(); i++) {
-                long[] rec = cd.get(i);
-                byte[] nameB = names.get(i).getBytes("UTF-8");
-                byte[] ch = new byte[46];
-                putInt(ch, 0, 0x02014b50);
-                putShort(ch, 4, 20);
-                putShort(ch, 6, 20);
-                putShort(ch, 8, 0x0800);
-                putShort(ch, 10, (int) rec[0]);
-                putShort(ch, 12, (int) rec[1] & 0xFFFF);
-                putShort(ch, 14, ((int) rec[1] >>> 16) & 0xFFFF);
-                putInt(ch, 16, (int) rec[2]);
-                putInt(ch, 20, (int) rec[3]);
-                putInt(ch, 24, (int) rec[4]);
-                putShort(ch, 28, nameB.length);
-                putShort(ch, 30, 0);
-                putShort(ch, 32, 0);
-                putShort(ch, 34, 0);
-                putShort(ch, 36, 0);
-                putInt(ch, 38, 0);
-                putInt(ch, 42, (int) rec[6]);
-                bos.write(ch);
-                bos.write(nameB);
-            }
-            long cdSize = offset - cdStart;
-
-            byte[] eocd = new byte[22];
-            putInt(eocd, 0, 0x06054b50);
-            putShort(eocd, 4, 0);
-            putShort(eocd, 6, 0);
-            putShort(eocd, 8, cd.size());
-            putShort(eocd, 10, cd.size());
-            putInt(eocd, 12, (int) cdSize);
-            putInt(eocd, 16, (int) cdStart);
-            putShort(eocd, 20, 0);
-            bos.write(eocd);
-            bos.flush();
-            bos.close();
         } finally {
             zf.close();
         }
-    }
-
-    private static boolean isSignatureEntry(String name) {
-        if (!name.startsWith("META-INF/")) return false;
-        String u = name.toUpperCase(Locale.US);
-        return u.equals("META-INF/MANIFEST.MF")
-                || u.endsWith(".SF") || u.endsWith(".RSA")
-                || u.endsWith(".DSA") || u.endsWith(".EC");
-    }
-
-    private static void putInt(byte[] b, int off, int v) {
-        b[off] = (byte) v; b[off + 1] = (byte) (v >>> 8);
-        b[off + 2] = (byte) (v >>> 16); b[off + 3] = (byte) (v >>> 24);
-    }
-
-    private static void putShort(byte[] b, int off, int v) {
-        b[off] = (byte) v; b[off + 1] = (byte) (v >>> 8);
-    }
-
-    private static int dosDateTime() {
-        Calendar c = Calendar.getInstance();
-        int year = Math.max(0, c.get(Calendar.YEAR) - 1980);
-        return (year << 25) | ((c.get(Calendar.MONTH) + 1) << 21)
-                | (c.get(Calendar.DAY_OF_MONTH) << 16)
-                | (c.get(Calendar.HOUR_OF_DAY) << 11)
-                | (c.get(Calendar.MINUTE) << 5)
-                | (c.get(Calendar.SECOND) >> 1);
+        return out;
     }
 
     // ================================================================
@@ -438,7 +288,7 @@ public class ApkEngine {
             String pkg = null;
             ZipEntry mj = zf.getEntry("manifest.json");
             if (mj != null) {
-                ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
                 copyStream(zf.getInputStream(mj), bo);
                 try {
                     pkg = new JSONObject(new String(bo.toByteArray(), "UTF-8"))
@@ -558,7 +408,7 @@ public class ApkEngine {
                 .setInputApk(in)
                 .setOutputApk(out)
                 .setMinSdkVersion(24)
-                .setV1SigningEnabled(true)
+                .setV1SigningEnabled(false)
                 .setV2SigningEnabled(true)
                 .setV3SigningEnabled(true)
                 .build()
