@@ -196,10 +196,11 @@ public class SettingsActivity extends Activity {
         col.addView(section("PROCESSING", resign, hint));
 
         // ---- ABOUT ----
-        TextView about = infoText("AntiAdapt M v1.0\nAPK conversion & build utility.\n\n"
-                + "Kill Verification removes signature blocks so the package can be "
-                + "re-signed safely. It does not modify DRM, licensing or anti-tamper "
-                + "protections.");
+        TextView about = infoText("AntiAdapt M v1.1\nAPK conversion & build utility.\n\n"
+        + "Kill Verification replaces existing v2/v3 signature blocks and "
+        + "re-signs with the managed key. Stale v1 files are ignored by "
+        + "Android 7.0+. It does not modify DRM, licensing or anti-tamper "
+        + "protections.");
         col.addView(section("ABOUT", about));
     }
 
