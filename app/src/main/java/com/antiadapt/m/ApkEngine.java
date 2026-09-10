@@ -465,7 +465,7 @@ public class ApkEngine {
             Pkg Q = null;
             for (Pkg q : S.pkgs) if (q.id == P.id) { Q = q; break; }
             if (Q == null) continue;
-            mergePackageInto(P, Q, pending);
+            mergePackageInto(P, Q, S.global != null ? S.global : new SP(), A.global, pending);
             merged++;
         }
         if (merged == 0) throw new IOException("No compatible split resource packages.");
@@ -677,7 +677,7 @@ public class ApkEngine {
         return sp;
     }
 
-    private static void mergePackageInto(Pkg P, Pkg Q, List<Object[]> pending) throws IOException {
+        private static void mergePackageInto(Pkg P, Pkg Q, SP srcG, SP dstG, List<Object[]> pending) throws IOException {
         if (P.types == null || P.keys == null)
             throw new IOException("Base ARSC pools missing.");
         for (Typ qt : Q.typeList) {
@@ -716,7 +716,7 @@ public class ApkEngine {
                     Ent copy = cloneEnt(e);
                     Integer xi = P.keys.indexOf.get(kn);
                     copy.key = xi != null ? xi : P.keys.intern(encodeString(kn, P.keys.utf8), kn);
-                    remapVals(copy, Q, P, pending);
+                    remapVals(copy, Q, srcG, dstG, pending);
                     c.entries.put(newIdx, copy);
                     t.keyIndex.put(kn, newIdx);
                 }
@@ -724,13 +724,13 @@ public class ApkEngine {
         }
     }
 
-    private static void remapVals(Ent e, Pkg Q, Pkg P, List<Object[]> pending) {
+    private static void remapVals(Ent e, Pkg Q, SP srcG, SP dstG, List<Object[]> pending) {
         if (e.val != null && e.val.dataType == 3)
-            e.val.data = gmap(Q.global, P.global, (int) e.val.data);
+            e.val.data = gmap(srcG, dstG, (int) e.val.data);
         if (e.maps != null)
             for (MapIt m : e.maps) {
                 if (m.v != null && m.v.dataType == 3)
-                    m.v.data = gmap(Q.global, P.global, (int) m.v.data);
+                    m.v.data = gmap(srcG, dstG, (int) m.v.data);
                 pending.add(new Object[]{Q, m});
             }
     }
@@ -1484,5 +1484,159 @@ public class ApkEngine {
 
     private static void putShort(byte[] b, int off, int v) {
         b[off] = (byte) v; b[off + 1] = (byte) (v >>> 8);
+    }
+    
+    // ================================================================
+    // VALIDATION & EXTRACTION HELPERS
+    // ================================================================
+
+    private static List<String> findV1SignatureFiles(File apk) throws IOException {
+        List<String> out = new ArrayList<>();
+        ZipFile zf;
+        try { zf = new ZipFile(apk); }
+        catch (Exception ex) { throw new IOException("Corrupted package (cannot open as ZIP)."); }
+        try {
+            Enumeration<? extends ZipEntry> en = zf.entries();
+            while (en.hasMoreElements()) {
+                String n = en.nextElement().getName();
+                if (n.startsWith("META-INF/")) {
+                    String u = n.toUpperCase(Locale.US);
+                    if (u.endsWith(".SF") || u.endsWith(".RSA")
+                            || u.endsWith(".DSA") || u.endsWith(".EC")) out.add(n);
+                }
+            }
+        } finally {
+            zf.close();
+        }
+        return out;
+    }
+
+    public static void verifyApk(File apk) throws Exception {
+        ApkVerifier.Result res = new ApkVerifier.Builder(apk)
+                .setMinCheckedPlatformVersion(24)
+                .build()
+                .verify();
+        if (!res.isVerified()) {
+            StringBuilder sb = new StringBuilder("APK validation failed");
+            for (Object err : res.getErrors()) sb.append("\n- ").append(err);
+            throw new IOException(sb.toString());
+        }
+    }
+
+    private static void requireValidApkZip(File f) throws IOException {
+        ZipFile zf;
+        try { zf = new ZipFile(f); }
+        catch (Exception ex) { throw new IOException("Corrupted or unsupported package (cannot open as ZIP)."); }
+        try {
+            boolean hasManifest = zf.getEntry("AndroidManifest.xml") != null;
+            boolean project = zf.getEntry("apktool.yml") != null;
+            if (project) throw new IOException(
+                    "Decompiled APK project detected. Rebuild it with APKTool first.");
+            if (!hasManifest) throw new IOException("Not a valid APK (AndroidManifest.xml missing).");
+            if (zf.size() < 3) throw new IOException("Corrupted APK package.");
+        } finally {
+            zf.close();
+        }
+    }
+
+    private static List<File> extractApksFromZip(File archive, File destDir,
+                                                 Callback cb) throws IOException {
+        List<File> out = new ArrayList<>();
+        List<ZipEntry> apkEntries = new ArrayList<>();
+        List<ZipEntry> obbEntries = new ArrayList<>();
+        boolean project = false;
+        ZipFile zf;
+        try { zf = new ZipFile(archive); }
+        catch (Exception ex) { throw new IOException("Corrupted package (cannot open as ZIP)."); }
+        try {
+            Enumeration<? extends ZipEntry> en = zf.entries();
+            while (en.hasMoreElements()) {
+                ZipEntry e = en.nextElement();
+                String n = e.getName();
+                String low = n.toLowerCase(Locale.US);
+                if (low.endsWith(".apk") && !low.startsWith("meta-inf/")) apkEntries.add(e);
+                else if (low.endsWith(".obb")) obbEntries.add(e);
+                if (n.equals("apktool.yml") || low.startsWith("smali/")
+                        || low.startsWith("smali_classes")) project = true;
+            }
+            if (apkEntries.isEmpty()) {
+                if (project) throw new IOException(
+                        "Decompiled APK project detected (smali/apktool). Rebuilding needs "
+                                + "APKTool + aapt2 - not supported in this build.");
+                throw new IOException("No APK found inside this package.");
+            }
+            cb.onLog(apkEntries.size() + " APK file(s) found in package.");
+            for (ZipEntry e : apkEntries) {
+                if (cb.isCancelled()) throw new IOException("CANCELLED");
+                File dst = new File(destDir, new File(e.getName()).getName());
+                InputStream is = zf.getInputStream(e);
+                if (is == null) throw new IOException("Corrupted package (unreadable entry).");
+                copyStream(is, new FileOutputStream(dst));
+                out.add(dst);
+                cb.onLog("Extracted: " + dst.getName() + " (" + fmtSize(dst.length()) + ")");
+            }
+            if (!obbEntries.isEmpty()) copyObb(zf, obbEntries, cb);
+        } finally {
+            zf.close();
+        }
+        return out;
+    }
+
+    private static void copyObb(ZipFile zf, List<ZipEntry> obbEntries, Callback cb) {
+        try {
+            String pkg = null;
+            ZipEntry mj = zf.getEntry("manifest.json");
+            if (mj != null) {
+                ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                copyStream(zf.getInputStream(mj), bo);
+                try {
+                    pkg = new JSONObject(new String(bo.toByteArray(), "UTF-8"))
+                            .getString("package_name");
+                } catch (Exception ignored) {}
+            }
+            if (pkg == null) {
+                cb.onLog("OBB found but package name unknown - OBB not copied.");
+                return;
+            }
+            File dir = new File(Environment.getExternalStorageDirectory(), "Android/obb/" + pkg);
+            if (!(dir.exists() || dir.mkdirs())) {
+                cb.onLog("OBB skipped (cannot write Android/obb).");
+                return;
+            }
+            for (ZipEntry e : obbEntries) {
+                File dst = new File(dir, new File(e.getName()).getName());
+                copyStream(zf.getInputStream(e), new FileOutputStream(dst));
+                cb.onLog("OBB copied: " + dst.getName());
+            }
+        } catch (Exception e) {
+            cb.onLog("OBB copy failed: " + e.getMessage());
+        }
+    }
+
+    private static void writeStoredZip(List<File> files, File out) throws IOException {
+        ZipOutputStream zos = new ZipOutputStream(
+                new BufferedOutputStream(new FileOutputStream(out), 1 << 16));
+        byte[] buf = new byte[1 << 16];
+        try {
+            for (File f : files) {
+                ZipEntry e = new ZipEntry(f.getName());
+                e.setMethod(ZipEntry.STORED);
+                e.setSize(f.length());
+                e.setCompressedSize(f.length());
+                CRC32 crc = new CRC32();
+                InputStream in = new FileInputStream(f);
+                int r;
+                while ((r = in.read(buf)) > 0) crc.update(buf, 0, r);
+                in.close();
+                e.setCrc(crc.getValue());
+                zos.putNextEntry(e);
+                in = new FileInputStream(f);
+                while ((r = in.read(buf)) > 0) zos.write(buf, 0, r);
+                in.close();
+                zos.closeEntry();
+            }
+        } finally {
+            zos.close();
+        }
     }
 }
